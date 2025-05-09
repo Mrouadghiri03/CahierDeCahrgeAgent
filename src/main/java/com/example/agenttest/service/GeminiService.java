@@ -11,7 +11,6 @@ import com.google.protobuf.Value;
 import com.google.protobuf.util.JsonFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -21,13 +20,13 @@ public class GeminiService {
 
     private static final Logger logger = LoggerFactory.getLogger(GeminiService.class);
 
-    @Value("${gemini.api.project-id}")
+    @org.springframework.beans.factory.annotation.Value("${gemini.api.project-id}")
     private String projectId;
 
-    @Value("${gemini.api.location}")
+    @org.springframework.beans.factory.annotation.Value("${gemini.api.location}")
     private String location; // e.g., "us-central1"
 
-    @Value("${gemini.api.model-name}")
+    @org.springframework.beans.factory.annotation.Value("${gemini.api.model-name}")
     private String modelName; // e.g., "gemini-1.0-pro" or "gemini-1.5-flash-001"
 
 
@@ -35,7 +34,8 @@ public class GeminiService {
         logger.debug("Sending request to Gemini API. Project: {}, Location: {}, Model: {}", projectId, location, modelName);
 
         String endpoint = String.format("%s-aiplatform.googleapis.com:443", location);
-        EndpointName endpointName = EndpointName.ofProjectLocationPublisherModel(projectId, location, "google", modelName);
+        EndpointName endpointName = EndpointName.of(
+                projectId, location, modelName);
 
         try (PredictionServiceClient predictionServiceClient = PredictionServiceClient.create(
                 PredictionServiceSettings.newBuilder().setEndpoint(endpoint).build())) {
@@ -54,7 +54,7 @@ public class GeminiService {
 
             PredictRequest request = PredictRequest.newBuilder()
                     .setEndpoint(endpointName.toString())
-                    .addInputs(promptValue) // 'inputs' is the correct field for structured input
+                    .addInstances(promptValue)  // Changed from addInputs() to addInstances()
                     .build();
 
             logger.debug("Sending PredictRequest to Gemini: {}", request.toString().substring(0, Math.min(request.toString().length(), 500))); // Log truncated request
@@ -62,8 +62,8 @@ public class GeminiService {
             PredictResponse predictResponse = predictionServiceClient.predict(request);
             logger.debug("Received raw response from Gemini.");
 
-            if (predictResponse.getOutputsCount() > 0) {
-                Value outputValue = predictResponse.getOutputs(0);
+            if (predictResponse.getPredictionsCount() > 0) {
+                Value outputValue = predictResponse.getPredictions(0);
                 String jsonOutput = "";
 
                 if (outputValue.hasStructValue() && outputValue.getStructValue().getFieldsMap().containsKey("content")) {
