@@ -1,8 +1,13 @@
 package com.example.agenttest.service;
 
 import com.example.agenttest.exception.GeminiApiException;
-import com.google.cloud.aiplatform.v1.*;
+import com.google.cloud.aiplatform.v1.EndpointName;
+import com.google.cloud.aiplatform.v1.PredictRequest;
+import com.google.cloud.aiplatform.v1.PredictResponse;
+import com.google.cloud.aiplatform.v1.PredictionServiceClient;
+import com.google.cloud.aiplatform.v1.PredictionServiceSettings;
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.Value;
 import com.google.protobuf.util.JsonFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,7 +15,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
-import java.util.Collections;
 
 @Service
 public class GeminiService {
@@ -33,92 +37,81 @@ public class GeminiService {
         String endpoint = String.format("%s-aiplatform.googleapis.com:443", location);
         EndpointName endpointName = EndpointName.ofProjectLocationPublisherModel(projectId, location, "google", modelName);
 
-
         try (PredictionServiceClient predictionServiceClient = PredictionServiceClient.create(
                 PredictionServiceSettings.newBuilder().setEndpoint(endpoint).build())) {
 
             String prompt = buildPrompt(textExplanation);
             logger.debug("Constructed Prompt: {}", prompt);
 
-            Value.Builder instanceValue = Value.newBuilder();
-            JsonFormat.parser().merge(String.format("{\"prompt\": \"%s\"}", escapeStringForJson(prompt)), instanceValue);
-            // For newer Gemini models that support direct text prompts in a structured way:
-            // You might need to structure the input according to the specific model's requirements.
-            // For example, some models expect a `content` block with `parts` and `text`.
-            // The `google-cloud-aiplatform` library might have specific builders for this.
-            // This example uses a generic JSON approach which is common for models expecting a JSON payload.
-            // Refer to the official Google Cloud documentation for the exact input schema for your chosen Gemini model.
+            Value.Builder promptValueBuilder = Value.newBuilder();
+            try {
+                JsonFormat.parser().merge(String.format("{\"prompt\": \"%s\"}", escapeStringForJson(prompt)), promptValueBuilder);
+            } catch (InvalidProtocolBufferException e) {
+                logger.error("Error merging prompt into Value: {}", e.getMessage(), e);
+                throw new GeminiApiException("Error creating Gemini request.", e);
+            }
+            Value promptValue = promptValueBuilder.build();
 
-            // If your Gemini model (e.g., gemini-1.5-flash) expects a `contents` structure:
-            // Content content = Content.newBuilder()
-            //    .setRole("user")
-            //    .addParts(Part.newBuilder().setText(prompt).build())
-            //    .build();
-            // PredictRequest request = PredictRequest.newBuilder()
-            //    .setEndpoint(endpointName.toString())
-            //    .addInstances(Value.newBuilder().setStructValue(Struct.newBuilder()
-            //        .putFields("contents", Value.newBuilder().setListValue(ListValue.newBuilder().addValues(Value.newBuilder().setStructValue(content.toBuilder()))).build())
-            //        .build()).build())
-            //    .build();
-
-            // Simpler prompt for models like gemini-1.0-pro that might take a direct prompt string within instances:
             PredictRequest request = PredictRequest.newBuilder()
                     .setEndpoint(endpointName.toString())
-                    .addInstances(instanceValue.build())
+                    .addInputs(promptValue) // 'inputs' is the correct field for structured input
                     .build();
-
 
             logger.debug("Sending PredictRequest to Gemini: {}", request.toString().substring(0, Math.min(request.toString().length(), 500))); // Log truncated request
 
             PredictResponse predictResponse = predictionServiceClient.predict(request);
             logger.debug("Received raw response from Gemini.");
 
-            if (predictResponse.getPredictionsCount() > 0) {
-                // The actual structure of the response depends heavily on the Gemini model and version.
-                // For models returning JSON in a string field (often 'content' or within a structure):
-                Value prediction = predictResponse.getPredictions(0);
-                String jsonOutput;
+            if (predictResponse.getOutputsCount() > 0) {
+                Value outputValue = predictResponse.getOutputs(0);
+                String jsonOutput = "";
 
-                if (prediction.hasStructValue() && prediction.getStructValue().getFieldsMap().containsKey("candidates")) {
-                    // Handling for structure like gemini-1.5-flash
-                    // { "candidates": [ { "content": { "role": "model", "parts": [ { "text": "JSON_HERE" } ] } } ] }
-                    var candidatesList = prediction.getStructValue().getFieldsOrThrow("candidates").getListValue();
+                if (outputValue.hasStructValue() && outputValue.getStructValue().getFieldsMap().containsKey("content")) {
+                    // This handles the structure where the JSON is directly under the "content" key
+                    jsonOutput = outputValue.getStructValue().getFieldsOrThrow("content").getStringValue();
+                } else if (outputValue.hasStructValue() && outputValue.getStructValue().getFieldsMap().containsKey("candidates")) {
+                    // Handle the 'candidates' structure (common in newer Gemini versions)
+                    var candidatesList = outputValue.getStructValue().getFieldsOrThrow("candidates").getListValue();
                     if (candidatesList.getValuesCount() > 0) {
                         var firstCandidate = candidatesList.getValues(0).getStructValue();
-                        var contentStruct = firstCandidate.getFieldsOrThrow("content").getStructValue();
-                        var partsList = contentStruct.getFieldsOrThrow("parts").getListValue();
-                        if (partsList.getValuesCount() > 0) {
-                            jsonOutput = partsList.getValues(0).getStructValue().getFieldsOrThrow("text").getStringValue();
+                        if (firstCandidate.getFieldsMap().containsKey("content")) {
+                            var content = firstCandidate.getFieldsOrThrow("content").getStructValue();
+                            if (content.getFieldsMap().containsKey("parts") && content.getFieldsOrThrow("parts").getListValue().getValuesCount() > 0) {
+                                var firstPart = content.getFieldsOrThrow("parts").getListValue().getValues(0).getStructValue();
+                                if (firstPart.getFieldsMap().containsKey("text")) {
+                                    jsonOutput = firstPart.getFieldsOrThrow("text").getStringValue();
+                                } else {
+                                    logger.warn("Gemini response 'parts' array's first element has no 'text' field.");
+                                    throw new GeminiApiException("Unexpected Gemini response structure.");
+                                }
+                            } else {
+                                logger.warn("Gemini response 'content' has no 'parts' or 'parts' is empty.");
+                                throw new GeminiApiException("Unexpected Gemini response structure.");
+                            }
                         } else {
-                            throw new GeminiApiException("Gemini response 'parts' array is empty.");
+                            logger.warn("Gemini response 'candidates' first element has no 'content' field.");
+                            throw new GeminiApiException("Unexpected Gemini response structure.");
                         }
                     } else {
-                        throw new GeminiApiException("Gemini response 'candidates' array is empty.");
+                        logger.warn("Gemini response 'candidates' array is empty.");
+                        throw new GeminiApiException("Gemini API returned no valid candidates.");
                     }
-                } else if (prediction.hasStructValue() && prediction.getStructValue().getFieldsMap().containsKey("content")) {
-                    // Handling for older/other structures that might have a direct 'content' field with the JSON string
-                    jsonOutput = prediction.getStructValue().getFieldsOrThrow("content").getStringValue();
-                }
-                else if (prediction.hasStringValue()) {
-                    // Fallback if the prediction itself is just a string (less common for structured JSON output)
-                    jsonOutput = prediction.getStringValue();
-                }
-                else {
-                    // Log the prediction structure if it's not what we expect
-                    logger.error("Unexpected Gemini prediction structure: {}", prediction);
-                    throw new GeminiApiException("Unexpected Gemini prediction structure. Expected a structure containing 'candidates' or 'content', or a direct string value.");
+                } else if (outputValue.hasStringValue()) {
+                    // Fallback if the output is directly a string
+                    jsonOutput = outputValue.getStringValue();
+                } else {
+                    logger.error("Unexpected Gemini output structure: {}", outputValue);
+                    throw new GeminiApiException("Unexpected Gemini output structure.");
                 }
 
-                logger.debug("Extracted JSON Output from Gemini: {}", jsonOutput.substring(0, Math.min(jsonOutput.length(),500)));
-                // Ensure the output is actual JSON and not wrapped in markdown code blocks
+                logger.debug("Extracted JSON Output from Gemini: {}", jsonOutput.substring(0, Math.min(jsonOutput.length(), 500)));
                 return extractJsonFromMarkdown(jsonOutput);
+
             } else {
-                logger.warn("Gemini API returned no predictions.");
-                throw new GeminiApiException("Gemini API returned no predictions.");
+                logger.warn("Gemini API returned no outputs.");
+                throw new GeminiApiException("Gemini API returned no outputs.");
             }
-        } catch (InvalidProtocolBufferException e) {
-            logger.error("Error parsing JSON for Gemini request: {}", e.getMessage(), e);
-            throw new GeminiApiException("Error creating request for Gemini: " + e.getMessage(), e);
+
         } catch (IOException e) {
             logger.error("IOException during Gemini API call: {}", e.getMessage(), e);
             throw new GeminiApiException("Error communicating with Gemini API: " + e.getMessage(), e);
@@ -143,7 +136,6 @@ public class GeminiService {
         return text.trim();
     }
 
-
     private String escapeStringForJson(String s) {
         return s.replace("\\", "\\\\")
                 .replace("\"", "\\\"")
@@ -155,7 +147,6 @@ public class GeminiService {
     }
 
     private String buildPrompt(String textExplanation) {
-        // This prompt is crucial. You will need to iterate on it.
         return String.format("""
         You are an expert software design assistant. Analyze the following text and extract information to create a UML class diagram.
         Identify all classes, their attributes (with data types if inferable, and visibility like public, private, protected, or package), and their methods (with parameters including names and types, return types, and visibility).
