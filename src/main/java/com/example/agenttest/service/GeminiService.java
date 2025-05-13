@@ -1,221 +1,148 @@
 package com.example.agenttest.service;
 
 import com.example.agenttest.exception.GeminiApiException;
-import com.google.cloud.aiplatform.v1.EndpointName;
-import com.google.cloud.aiplatform.v1.PredictRequest;
-import com.google.cloud.aiplatform.v1.PredictResponse;
-import com.google.cloud.aiplatform.v1.PredictionServiceClient;
-import com.google.cloud.aiplatform.v1.PredictionServiceSettings;
-import com.google.protobuf.InvalidProtocolBufferException;
-import com.google.protobuf.Value;
-import com.google.protobuf.util.JsonFormat;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
 
-import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 @Service
 public class GeminiService {
 
     private static final Logger logger = LoggerFactory.getLogger(GeminiService.class);
+    private static final String GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s";
 
-    @org.springframework.beans.factory.annotation.Value("${gemini.api.project-id}")
-    private String projectId;
+    @Value("${gemini.api.key}")
+    private String apiKey;
 
-    @org.springframework.beans.factory.annotation.Value("${gemini.api.location}")
-    private String location; // e.g., "us-central1"
+    @Value("${gemini.api.model-name}")
+    private String modelName; // e.g., "gemini-2.0-flash"
 
-    @org.springframework.beans.factory.annotation.Value("${gemini.api.model-name}")
-    private String modelName; // e.g., "gemini-1.0-pro" or "gemini-1.5-flash-001"
-
+    private final RestTemplate restTemplate = new RestTemplate();
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     public String getDiagramDataFromText(String textExplanation) {
-        logger.debug("Sending request to Gemini API. Project: {}, Location: {}, Model: {}", projectId, location, modelName);
+        try {
+            final String prompt = buildPrompt(textExplanation);
+            final String responseText = callGeminiApi(prompt);
 
-        String endpoint = String.format("%s-aiplatform.googleapis.com:443", location);
-        EndpointName endpointName = EndpointName.of(
-                projectId, location, modelName);
-
-        try (PredictionServiceClient predictionServiceClient = PredictionServiceClient.create(
-                PredictionServiceSettings.newBuilder().setEndpoint(endpoint).build())) {
-
-            String prompt = buildPrompt(textExplanation);
-            logger.debug("Constructed Prompt: {}", prompt);
-
-            Value.Builder promptValueBuilder = Value.newBuilder();
-            try {
-                JsonFormat.parser().merge(String.format("{\"prompt\": \"%s\"}", escapeStringForJson(prompt)), promptValueBuilder);
-            } catch (InvalidProtocolBufferException e) {
-                logger.error("Error merging prompt into Value: {}", e.getMessage(), e);
-                throw new GeminiApiException("Error creating Gemini request.", e);
-            }
-            Value promptValue = promptValueBuilder.build();
-
-            PredictRequest request = PredictRequest.newBuilder()
-                    .setEndpoint(endpointName.toString())
-                    .addInstances(promptValue)  // Changed from addInputs() to addInstances()
-                    .build();
-
-            logger.debug("Sending PredictRequest to Gemini: {}", request.toString().substring(0, Math.min(request.toString().length(), 500))); // Log truncated request
-
-            PredictResponse predictResponse = predictionServiceClient.predict(request);
-            logger.debug("Received raw response from Gemini.");
-
-            if (predictResponse.getPredictionsCount() > 0) {
-                Value outputValue = predictResponse.getPredictions(0);
-                String jsonOutput = "";
-
-                if (outputValue.hasStructValue() && outputValue.getStructValue().getFieldsMap().containsKey("content")) {
-                    // This handles the structure where the JSON is directly under the "content" key
-                    jsonOutput = outputValue.getStructValue().getFieldsOrThrow("content").getStringValue();
-                } else if (outputValue.hasStructValue() && outputValue.getStructValue().getFieldsMap().containsKey("candidates")) {
-                    // Handle the 'candidates' structure (common in newer Gemini versions)
-                    var candidatesList = outputValue.getStructValue().getFieldsOrThrow("candidates").getListValue();
-                    if (candidatesList.getValuesCount() > 0) {
-                        var firstCandidate = candidatesList.getValues(0).getStructValue();
-                        if (firstCandidate.getFieldsMap().containsKey("content")) {
-                            var content = firstCandidate.getFieldsOrThrow("content").getStructValue();
-                            if (content.getFieldsMap().containsKey("parts") && content.getFieldsOrThrow("parts").getListValue().getValuesCount() > 0) {
-                                var firstPart = content.getFieldsOrThrow("parts").getListValue().getValues(0).getStructValue();
-                                if (firstPart.getFieldsMap().containsKey("text")) {
-                                    jsonOutput = firstPart.getFieldsOrThrow("text").getStringValue();
-                                } else {
-                                    logger.warn("Gemini response 'parts' array's first element has no 'text' field.");
-                                    throw new GeminiApiException("Unexpected Gemini response structure.");
-                                }
-                            } else {
-                                logger.warn("Gemini response 'content' has no 'parts' or 'parts' is empty.");
-                                throw new GeminiApiException("Unexpected Gemini response structure.");
-                            }
-                        } else {
-                            logger.warn("Gemini response 'candidates' first element has no 'content' field.");
-                            throw new GeminiApiException("Unexpected Gemini response structure.");
-                        }
-                    } else {
-                        logger.warn("Gemini response 'candidates' array is empty.");
-                        throw new GeminiApiException("Gemini API returned no valid candidates.");
-                    }
-                } else if (outputValue.hasStringValue()) {
-                    // Fallback if the output is directly a string
-                    jsonOutput = outputValue.getStringValue();
-                } else {
-                    logger.error("Unexpected Gemini output structure: {}", outputValue);
-                    throw new GeminiApiException("Unexpected Gemini output structure.");
-                }
-
-                logger.debug("Extracted JSON Output from Gemini: {}", jsonOutput.substring(0, Math.min(jsonOutput.length(), 500)));
-                return extractJsonFromMarkdown(jsonOutput);
-
-            } else {
-                logger.warn("Gemini API returned no outputs.");
-                throw new GeminiApiException("Gemini API returned no outputs.");
-            }
-
-        } catch (IOException e) {
-            logger.error("IOException during Gemini API call: {}", e.getMessage(), e);
-            throw new GeminiApiException("Error communicating with Gemini API: " + e.getMessage(), e);
+            // Return the raw response text - let the parser handle the specific format
+            return responseText;
         } catch (Exception e) {
-            logger.error("Unexpected error during Gemini API call: {}", e.getMessage(), e);
-            throw new GeminiApiException("An unexpected error occurred with Gemini API: " + e.getMessage(), e);
+            logger.error("Error calling Gemini API", e);
+            throw new GeminiApiException("Failed to generate diagram data: " + e.getMessage(), e);
         }
     }
 
-    private String extractJsonFromMarkdown(String text) {
-        if (text.startsWith("```json")) {
-            text = text.substring(7);
-            if (text.endsWith("```")) {
-                text = text.substring(0, text.length() - 3);
-            }
-        } else if (text.startsWith("```")) {
-            text = text.substring(3);
-            if (text.endsWith("```")) {
-                text = text.substring(0, text.length() - 3);
-            }
-        }
-        return text.trim();
-    }
+    private String callGeminiApi(String prompt) {
+        // Prepare headers
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
 
-    private String escapeStringForJson(String s) {
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\b", "\\b")
-                .replace("\f", "\\f")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+        // Prepare request body
+        Map<String, Object> requestBody = new HashMap<>();
+        Map<String, Object> content = new HashMap<>();
+        Map<String, Object> part = new HashMap<>();
+
+        part.put("text", prompt);
+        content.put("parts", List.of(part));
+        requestBody.put("contents", List.of(content));
+
+        // Create request entity
+        HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestBody, headers);
+
+        // Make API call
+        String url = String.format(GEMINI_API_URL, modelName, apiKey);
+        ResponseEntity<String> responseEntity = restTemplate.postForEntity(url, request, String.class);
+
+        if (!responseEntity.getStatusCode().is2xxSuccessful()) {
+            throw new GeminiApiException("Gemini API returned non-success status: " + responseEntity.getStatusCode());
+        }
+
+        String responseBody = responseEntity.getBody();
+        logger.debug("Gemini API raw response: {}", responseBody);
+
+        try {
+            // Parse the JSON response manually to extract the text content
+            Map<String, Object> responseMap = objectMapper.readValue(responseBody, Map.class);
+
+            if (responseMap.containsKey("candidates")) {
+                List<Map<String, Object>> candidates = (List<Map<String, Object>>) responseMap.get("candidates");
+                if (!candidates.isEmpty()) {
+                    Map<String, Object> candidate = candidates.get(0);
+                    if (candidate.containsKey("content")) {
+                        Map<String, Object> content1 = (Map<String, Object>) candidate.get("content");
+                        if (content1.containsKey("parts")) {
+                            List<Map<String, Object>> parts = (List<Map<String, Object>>) content1.get("parts");
+                            if (!parts.isEmpty() && parts.get(0).containsKey("text")) {
+                                return (String) parts.get(0).get("text");
+                            }
+                        }
+                    }
+                }
+            }
+
+            logger.error("Unable to parse expected content from Gemini response: {}", responseBody);
+            throw new GeminiApiException("Failed to parse Gemini API response");
+        } catch (Exception e) {
+            logger.error("Error parsing Gemini API response: {}", e.getMessage());
+            throw new GeminiApiException("Failed to parse Gemini API response: " + e.getMessage(), e);
+        }
     }
 
     private String buildPrompt(String textExplanation) {
-        return String.format("""
-        You are an expert software design assistant. Analyze the following text and extract information to create a UML class diagram.
-        Identify all classes, their attributes (with data types if inferable, and visibility like public, private, protected, or package), and their methods (with parameters including names and types, return types, and visibility).
-        Also, identify relationships between classes:
-        - Inheritance (e.g., "class A extends class B")
-        - Realization (e.g., "class A implements interface B")
-        - Association (e.g., "class A uses class B", "class A has a reference to class B", with optional multiplicity like 1, *, 0..1, 1..*)
-        - Aggregation (e.g., "class A has a collection of class B", where B can exist independently)
-        - Composition (e.g., "class A is composed of class B", where B cannot exist without A)
+        // Modify the prompt to specifically request diagram data in JSON format
 
-        Provide the output STRICTLY in the following JSON format. Do not include any explanatory text before or after the JSON block.
-        If a detail (like visibility, type, or multiplicity) is not clearly specified or inferable, you can omit the field or use a sensible default (e.g., "String" for unknown type, "public" for visibility if not specified, or omit multiplicity).
-        For attributes and methods, visibility can be one of: "public", "private", "protected", "package".
-        For classes, include a "stereotype" field if it's an "interface" or "abstract" class. Otherwise, omit it or set to null.
-        For relationships, `type` can be: "Inheritance", "Realization", "Association", "Aggregation", "Composition".
-        `multiplicitySource` and `multiplicityTarget` are optional.
 
-        JSON Format:
-        {
-          "classes": [
-            {
-              "name": "ClassName",
-              "stereotype": "interface | abstract", // optional
-              "attributes": [
-                {"visibility": "private", "name": "attributeName", "type": "DataType"}
-              ],
-              "methods": [
-                {
-                  "visibility": "public",
-                  "name": "methodName",
-                  "parameters": [{"name": "paramName", "type": "ParamType"}],
-                  "returnType": "ReturnType"
-                }
-              ]
-            }
-          ],
-          "relationships": [
-            {
-              "type": "Inheritance",
-              "source": "ChildClass",
-              "target": "ParentClass"
-            },
-            {
-              "type": "Association",
-              "source": "ClassA",
-              "target": "ClassB",
-              "label": "uses", // optional
-              "multiplicitySource": "1", // optional
-              "multiplicityTarget": "*" // optional
-            },
-            { // Example for Aggregation
-              "type": "Aggregation",
-              "container": "ClassC", // Use 'container' and 'part' for Aggregation/Composition
-              "part": "ClassD",
-              "multiplicityPart": "*" // Multiplicity of the 'part' relative to container
-            },
-            { // Example for Composition
-              "type": "Composition",
-              "container": "ClassE", // Use 'container' and 'part' for Aggregation/Composition
-              "part": "ClassF",
-              "multiplicityPart": "1..*" // Multiplicity of the 'part' relative to container
-            }
-          ]
-        }
+        return """
+Analyze the following text and identify the key concepts (e.g., entities, objects, roles) and their relationships (e.g., associations, dependencies, inheritance, composition).
 
-        Input Text:
-        ---
-        %s
-        ---
-        """, textExplanation);
+Then, generate a PlantUML class diagram enclosed within @startuml and @enduml tags. Use appropriate PlantUML syntax to represent:
+
+* Classes (with attributes and methods if applicable)
+* Associations (with roles and multiplicities if available)
+* Inheritance or interfaces (extends/implements)
+* Aggregation or composition (if described)
+
+Ensure the PlantUML code is clean and properly formatted.
+Do not include explanations or commentary — only return the PlantUML code block.
+
+Example input:
+"A School has many Students. Each Student has a name and an ID. Teachers can teach multiple Students. Both Students and Teachers inherit from a common Person entity."
+
+Expected output:
+@startuml
+class Person {
++name: String
+}
+
+class Student {
++id: String
+}
+Person <|-- Student
+
+class Teacher {
+}
+Person <|-- Teacher
+
+class School {
+}
+School "1" --> "many" Student
+Teacher "1" --> "many" Student
+@enduml
+
+Now process this text:
+""" + textExplanation;
+
     }
 }
