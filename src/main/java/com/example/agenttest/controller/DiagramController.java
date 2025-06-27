@@ -55,7 +55,7 @@ public class DiagramController {
 
         try {
             logger.info("Received request to generate diagram from text.");
-            String geminiOutput = geminiService.getDiagramDataFromText(request.getText());
+            String geminiOutput = geminiService.generateCahierDeCharge(request.getText());
 
             if (geminiOutput == null || geminiOutput.isBlank()) {
                 logger.error("Gemini service returned empty output.");

@@ -31,9 +31,9 @@ public class GeminiService {
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    public String getDiagramDataFromText(String textExplanation) {
+    public String generateCahierDeCharge(String requirements) {
         try {
-            final String prompt = buildPrompt(textExplanation);
+            final String prompt = buildPrompt(requirements);
             final String responseText = callGeminiApi(prompt);
 
             // Return the raw response text - let the parser handle the specific format
@@ -100,10 +100,10 @@ public class GeminiService {
         }
     }
 
-    private String buildPrompt(String textExplanation) {
+    private String buildPrompt(String requirements) {
         // Modify the prompt to specifically request diagram data in JSON format
 
-
+/*
         return """
 Analyze the following text and identify the key concepts (e.g., entities, objects, roles) and their relationships (e.g., associations, dependencies, inheritance, composition).
 
@@ -143,6 +143,29 @@ Teacher "1" --> "many" Student
 
 Now process this text:
 """ + textExplanation;
+        */
+
+            return """
+    Génère un cahier de charge technique détaillé en français avec les sections suivantes :
+    1. **Introduction** : Contexte et objectifs
+    2. **Périmètre** : Fonctionnalités incluses/exclues
+    3. **Exigences techniques** : Stack, contraintes
+    4. **Livrables** : Liste des outputs attendus
+    5. **Planning estimé** : Phases clés
+
+    Format attendu : Markdown avec titres ## et listes à puces.
+
+    Exemple de sortie :
+    ## Introduction
+    - Objectif : Développer une app mobile de livraison de repas
+    - Public cible : Restaurants et clients finaux
+
+    ## Périmètre
+    - Inclus : Dashboard restaurant, suivi en temps réel
+    - Exclu : Paiement intégré (utilisation d'une API tierce)
+
+    Texte à analyser :
+    """ + requirements;
+        }
 
     }
-}
